@@ -4,6 +4,8 @@
 
 from __future__ import print_function
 
+import ast
+
 import time
 from datetime import timedelta
 
@@ -33,15 +35,16 @@ flags.DEFINE_boolean("maintenance_test", False, "Set to True for performing main
 flags.DEFINE_boolean("completion", False, "Set to True to run code completion experiment.")
 flags.DEFINE_boolean("maintenance_completion", False, "Set to True to run maintenance code completion experiment")
 flags.DEFINE_boolean("dynamic", False, "Set to True to run dynamic code completion experiment.")
-flags.DEFINE_integer("num_layers", 1, "Number of Layers. Using a single layer is advised.")
-flags.DEFINE_integer("hidden_size", 512, "Hidden size. Number of dimensions for the embeddings and RNN hidden state.")
 
 flags.DEFINE_string("train_filename", None, "The train file on which to train.")
 flags.DEFINE_string("validation_filename", None, "The test file on which to run validation.")
 flags.DEFINE_string("test_filename", None, "The test file on which to compute perplexity or predictability.")
 flags.DEFINE_string("test_proj_filename", None, "The file that contains the test project name for each test instance.")
+flags.DEFINE_string("identifier_map", None, "The file that contains information about which tokens are identifiers.")
 flags.DEFINE_string("output_probs_file", "predictionProbabilities.txt", "The file to store output probabilities.")
 
+flags.DEFINE_integer("num_layers", 1, "Number of Layers. Using a single layer is advised.")
+flags.DEFINE_integer("hidden_size", 512, "Hidden size. Number of dimensions for the embeddings and RNN hidden state.")
 flags.DEFINE_float("keep_prob", 0.5, "Keep probability = 1.0 - dropout probability.")
 flags.DEFINE_integer("vocab_size", 25000, "Vocabulary size")
 flags.DEFINE_integer("steps_per_checkpoint", 1000, "Number of steps for printing stats (validation is run) and checkpointing the model. Must be increased by 'a lot' for large training corpora.")
@@ -353,7 +356,8 @@ class NLM(object):
 
       if FLAGS.token_model:
         targets = [t for tar in target for t in tar]
-        loss = [-math.log(1.0/len(self.train_vocab), 2) if t == self.train_vocab["-UNK-"] else l
+        voc_size = 10500000
+        loss = [-math.log(1.0/voc_size, 2) if t == self.train_vocab["-UNK-"] else l
                 for l,t in zip(loss, targets) ]
 
       log_perp_unnorm += np.sum(loss)
@@ -902,7 +906,7 @@ class NLM(object):
     print('Is it correct perplexity:', sum([perp * weight for perp, weight in zip(test_losses, len_weights)]))
     return test_losses_sum / ctr
 
-  def completion(self, session, config, test_dataset, test_projects, beam_size, dynamic=False):
+  def completion(self, session, config, test_dataset, test_projects, beam_size, dynamic=False, id_map=None):
     """
     Runs code the code completion scenario. Dynamic update can be performed but by default is turned off.
     :param session: The TF session in which operations should be run.
@@ -914,6 +918,12 @@ class NLM(object):
     :return:
     """
     mrr = 0.0
+    id_mrr = 0.0
+    id_acc1 = 0.0
+    id_acc3 = 0.0
+    id_acc5 = 0.0
+    id_acc10 = 0.0
+
     satisfaction_prob = 0.8
     top_needed = 10
     verbose = False
@@ -921,8 +931,9 @@ class NLM(object):
     train_every = config.num_steps
     tokens_done = 0
     files_done = 0
+    identifiers = 0
     state = session.run(self.reset_state)
-
+    
     raw_data = test_dataset.data  # is just one long array
     data_len = len(raw_data)
     print('Data Length:', data_len)
@@ -953,8 +964,11 @@ class NLM(object):
       file_start_index = data_covered
       print('Completion Length:', len(file_data))
 
+      if not id_map is None: file_ids = id_map[files_done] + [0]
+      else: file_ids = [0] * (len(file_data) - 1)
+
       # New file so empty the cache
-      ngram_cache = dict()
+      # ngram_cache = dict()
       tokens_before = deque([None, test_dataset.rev_vocab[file_data[0]]], 2)
 
       state = session.run(self.reset_state)
@@ -966,8 +980,8 @@ class NLM(object):
       train_start = 0
       train_end = 0
       # to_add = []
-      for subtoken_id, context_target in enumerate(zip(file_data[:-1], file_data[1:])):
-        context, target = context_target
+      for subtoken_id, context_target_is_id in enumerate(zip(file_data[:-1], file_data[1:], file_ids)):
+        context, target, is_id = context_target_is_id
         train_end += 1
 
         # to_add.append(test_dataset.rev_vocab[context])
@@ -1025,6 +1039,8 @@ class NLM(object):
           continue
         else:
           tokens_done += 1
+          if not id_map is None and is_id:
+            identifiers += 1
           if not in_token:
             correct_subtokens = []
             remember_state = state
@@ -1073,6 +1089,17 @@ class NLM(object):
               correct_found = True
               if verbose: print('MRR:', mrr / tokens_done)
               if verbose: print()
+              
+              if is_id:
+                id_mrr += 1.0 / rank
+                if rank <= 1:
+                  id_acc1 += 1.0
+                if rank <= 3:
+                  id_acc3 += 1.0
+                if rank <= 5:
+                  id_acc5 += 1.0
+                if rank <= 10:
+                  id_acc10 += 1.0
           continue
         if FLAGS.token_model: print('???')
 
@@ -1154,6 +1181,17 @@ class NLM(object):
             mrr += 1.0 / (i + 1)
             if verbose: print('MRR:', mrr / tokens_done)
             if verbose: print()
+            
+            if is_id:
+              id_mrr += 1.0 / (i + 1)
+              if (i + 1) <= 1:
+                id_acc1 += 1.0
+              if (i + 1) <= 3:
+                id_acc3 += 1.0
+              if (i + 1) <= 5:
+                id_acc5 += 1.0
+              if (i + 1) <= 10:
+                id_acc10 += 1.0
       files_done += 1
 
       # Train on remainder
@@ -1177,6 +1215,9 @@ class NLM(object):
           [self.train_step, self.cost, self.next_state, self.loss, self.iteration], feed_dict)
 
       print(files_done, 'MRR:', mrr / tokens_done)
+      if not id_map is None :
+        print(id_mrr / identifiers, id_acc1 / identifiers, id_acc3 / identifiers, \
+          id_acc5 / identifiers, id_acc10 / identifiers)
 
     print('Tokens scored:', tokens_done)
     return mrr / tokens_done
@@ -1589,11 +1630,11 @@ class NLM(object):
     :return:
     """
     parameters = {
-      "num_layers": self.num_layers,
-      "vocab_size": self.vocab_size,
-      "hidden_size": self.hidden_size,
-      "keep_probability": self.keep_probability,
-      "total_parameters": self.get_parameter_count()
+      "num_layers": str(self.num_layers),
+      "vocab_size": str(self.vocab_size),
+      "hidden_size": str(self.hidden_size),
+      "keep_probability": str(self.keep_probability),
+      "total_parameters": str(self.get_parameter_count())
     }
     with open(self.parameters_file(model_directory), "w") as f:
       json.dump(parameters, f, indent=4)
@@ -1713,6 +1754,8 @@ def main(_):
       with tf.Graph().as_default():
         with tf.Session(config=get_gpu_config()) as session:
           model = create_model(session, config)
+          model.train_vocab = train_vocab
+          model.train_vocab_rev = train_vocab_rev
           ppl = calculate_predictability(test_lines, train_vocab, train_vocab_rev, config, '', model, session)
       print("Average:", ppl)
       print("Total time %s" % timedelta(seconds=time.time() - start_time))
@@ -1768,6 +1811,7 @@ def main(_):
       # Default test scenario. Essentially entropy/perplexity calculation.
       vocab_path = FLAGS.train_dir + "/vocab.txt"
       train_vocab, train_vocab_rev = reader._read_vocab(vocab_path)
+      print(len(train_vocab))
       config.vocab_size = len(train_vocab)
       start_time = time.time()
       do_test(FLAGS.data_path + "/" + FLAGS.test_filename, train_vocab, train_vocab_rev, config)
@@ -1792,7 +1836,16 @@ def main(_):
           model = create_model(session, config)
           model.train_vocab = train_vocab
           model.train_vocab_rev = train_vocab_rev
-          mrr = model.completion(session, config, test_dataset, test_proj_lines, config.batch_size, FLAGS.dynamic)
+
+          id_map = None
+          if FLAGS.identifier_map:
+            id_map = []
+            with open(FLAGS.identifier_map, 'r') as f:
+              for line in f:
+                id_map.append(ast.literal_eval(line.rstrip('\n')))
+
+          mrr = model.completion(session, config, test_dataset, test_proj_lines, config.batch_size, \
+            FLAGS.dynamic, id_map)
           print(mrr)
       print("Total time %s" % timedelta(seconds=time.time() - start_time))
       print("Done completion!")
@@ -1838,6 +1891,8 @@ def main(_):
       with tf.Graph().as_default():
         with tf.Session(config=get_gpu_config()) as session:
           md = create_model(session, config)
+          md.train_vocab = train_vocab
+          md.train_vocab_rev = train_vocab_rev
           md.write_model_parameters(FLAGS.train_dir)
           md.train(session, config, train_dataset, exit_criteria, valid_dataset, FLAGS.train_dir)
       print("Total time %s" % timedelta(seconds=time.time() - start_time))
